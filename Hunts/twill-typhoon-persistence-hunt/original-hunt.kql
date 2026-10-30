@@ -1,0 +1,103 @@
+// Rule Title: Twill Typhoon IPRD Campaign Hunt – Suspicious Scheduled Task Persistence
+// Author: Jordan Meisels 2026-09-09
+// This query finds .DLL or .EXE's that were extracted by common .ZIP extraction software.
+let ExtractedFilesFromZip =
+    (
+    DeviceFileEvents
+    | where TimeGenerated between (datetime(2026-08-31T00:00:00Z) .. datetime(2026-09-02T04:00:00Z))
+    | where FileName endswith (".dll") or FileName endswith (".exe")
+    | where InitiatingProcessFileName in("explorer.exe", "7zFM.exe", "7z.exe", "RAR.exe", "WinRAR.exe")
+    | where ActionType == 'FileCreated'
+    | where isnotempty(SHA256)
+    | project
+        StarterTimeGenerated = TimeGenerated,
+        DeviceName,
+        FirstSHA = SHA256,
+        StarterFolderPath = FolderPath,
+        FileName
+    );
+// This query finds .DLL or .EXE's that were moved to a user writable path?
+let MovedFilePath =
+    (
+    DeviceFileEvents
+    | where TimeGenerated between (datetime(2026-08-31T00:00:00Z) .. datetime(2026-09-02T04:00:00Z))
+    | where FileName endswith (".dll") or FileName endswith (".exe")
+    | where ActionType == 'FileCreated'
+    | where isnotempty(SHA256)
+    | project
+        TimeFileMovedLocation = TimeGenerated,
+        DeviceName,
+        SecondSHA = SHA256,
+        SecondQueryFolderPath = FolderPath,
+        SecondFileName = FileName,
+        InitiatingProcessFileName,
+        InitiatingProcessSHA256
+    | where SecondQueryFolderPath has_any("Downloads", "OneDrive", "AppData", "Temp", "Public", "Desktop", "Documents")
+        or SecondQueryFolderPath contains "MicrosoftEdgeServices"
+    | join kind = inner (ExtractedFilesFromZip) on DeviceName, $left.SecondSHA == $right.FirstSHA
+    | where SecondQueryFolderPath != StarterFolderPath
+    | where TimeFileMovedLocation > StarterTimeGenerated
+    | summarize TimeFileMovedLocation = min(TimeFileMovedLocation)
+        by DeviceName, SecondSHA, StarterFolderPath, SecondQueryFolderPath
+    );
+// Compare the above query to where the file is then renamed to see the next recorded behavior.
+// File renaming is supporting evidence and is not required for the device to continue through the hunt.
+let RenamedFileEvents =
+    (
+    DeviceFileEvents
+    | where TimeGenerated between (datetime(2026-08-31T00:00:00Z) .. datetime(2026-09-02T04:00:00Z))
+    | where ActionType == 'FileRenamed'
+    | join kind = inner (MovedFilePath) on DeviceName, $left.SHA256 == $right.SecondSHA
+    | extend RenamedTime = TimeGenerated
+    | where RenamedTime > TimeFileMovedLocation
+    | project
+        RenamedTime,
+        DeviceName,
+        TimeFileMovedLocation,
+        PreviousFolderPath,
+        FolderPath,
+        PreviousFileName,
+        FileName,
+        SHA256
+    //Filter out false positives
+    | where PreviousFolderPath !contains "\\Program Files (x86)\\SoftwareX\\"
+    | where PreviousFolderPath !contains "C:\\Windows\\System32\\SoftwareY\\Temp\\"
+    | where PreviousFolderPath !contains "C:\\Program Files\\IBM\\SoftwareZ\\"
+    // Review results for RegExt.exe or CommonLib.dll. Either file under %LOCALAPPDATA%\MicrosoftEdgeServices is a major red flag.
+    );
+// Creates candidate devices from the moved-file behavior.
+// A subsequent FileRenamed event can strengthen the chain but is not required.
+let CandidateDevices =
+    (
+    MovedFilePath
+    | project DeviceName, CandidateTime = TimeFileMovedLocation
+    | union
+        (
+        RenamedFileEvents
+        | project DeviceName, CandidateTime = RenamedTime
+        )
+    | summarize FirstCandidateTime = min(CandidateTime) by DeviceName
+    );
+// Reviews Scheduled Tasks created after the candidate file behavior.
+// Filters tasks where the interval is 5 minutes or the Scheduled Task contains RegExt.exe.
+DeviceEvents
+| where TimeGenerated between (datetime(2026-08-31T00:00:00Z) .. datetime(2026-09-02T04:00:00Z))
+| where ActionType == 'ScheduledTaskCreated'
+| join kind = inner (CandidateDevices) on DeviceName
+| where TimeGenerated > FirstCandidateTime
+| extend ParsedAdditionalFields = parse_json(AdditionalFields)
+| extend ParsedTaskContent = parse_json(ParsedAdditionalFields.TaskContent)
+| where ParsedTaskContent contains '"Interval":"PT5M"'
+    or tostring(ParsedAdditionalFields) contains "RegExt.exe"
+| project
+    ScheduledTaskTime = TimeGenerated,
+    DeviceName,
+    FirstCandidateTime,
+    TaskName = tostring(ParsedAdditionalFields.TaskName),
+    SubjectUserName = tostring(ParsedAdditionalFields.SubjectUserName),
+    TaskCommand = tostring(ParsedTaskContent.Actions.Exec.Command),
+    TaskArguments = tostring(ParsedTaskContent.Actions.Exec.Arguments),
+    TimeTriggerInterval = tostring(ParsedTaskContent.Triggers.TimeTrigger.Repetition.Interval),
+    CalendarTriggerInterval = tostring(ParsedTaskContent.Triggers.CalendarTrigger.Repetition.Interval),
+    AdditionalFields
+| order by ScheduledTaskTime asc
