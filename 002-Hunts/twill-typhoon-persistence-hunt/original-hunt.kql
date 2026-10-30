@@ -1,4 +1,4 @@
-// Rule Title: Twill Typhoon IPRD Campaign Hunt – Suspicious Scheduled Task Persistence
+// Rule Title: Twill Typhoon Campaign Hunt – Suspicious Scheduled Task Persistence
 // Author: Jordan Meisels 2026-09-09
 // This query finds .DLL or .EXE's that were extracted by common .ZIP extraction software.
 let ExtractedFilesFromZip =
