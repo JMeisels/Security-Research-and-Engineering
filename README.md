@@ -40,7 +40,7 @@ Research and KQL hunting content focused on investigating suspected persistence 
 
 **[Explore Projects](./003-Projects/)**
 
-Tools and engineering experiments focused on improving security detection, investigation, and response workflows.
+Tools and engineering experiments focused on improving security detection, investigation, AI exploration and response workflows.
 
 Projects explore Python development, API integrations, containerization, security automation, and practical detection engineering.
 
